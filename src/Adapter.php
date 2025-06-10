@@ -1,10 +1,9 @@
 <?php
 
-namespace CasbinAdapter\Database;
+namespace PhpCasbinMysqliAdapter\Database;
 
 use Casbin\Model\Model;
 use Casbin\Persist\Adapter as AdapterContract;
-use Leeqvip\Database\Manager;
 use Casbin\Persist\AdapterHelper;
 use Casbin\Persist\FilteredAdapter as FilteredAdapterContract;
 use Casbin\Persist\Adapters\Filter;
@@ -23,26 +22,22 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
 {
     use AdapterHelper;
 
-    protected $config;
-
     protected $filtered;
 
-    protected $connection;
+    protected \mysqli $connection;
 
     public $policyTableName = 'casbin_rule';
 
     public $rows = [];
 
-    public function __construct(array $config)
+    public function __construct(\mysqli $connection, $policy_table_name = 'casbin_rule')
     {
-        $this->config = $config;
-        $this->filtered = false;
-        $this->connection = (new Manager($config))->getConnection();
-
-        if (isset($config['policy_table_name']) && !is_null($config['policy_table_name'])) {
-            $this->policyTableName = $config['policy_table_name'];
+        if ($connection->connect_error) {
+            throw new \Exception('MySQLi connection failed: ' . $connection->connect_error);
         }
-
+        $this->connection = $connection;
+        $this->filtered = false;
+        $this->policyTableName = $policy_table_name;
         $this->initTable();
     }
 
@@ -78,7 +73,7 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
 
         $i = count($rule) - 1;
         for (; $i >= 0; $i--) {
-            if ($rule[$i] != '' && !is_null($rule[$i])) {
+            if ($rule[$i] != '' && $rule[$i] !== null) {
                 break;
             }
         }
@@ -86,32 +81,46 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
         return array_slice($rule, 0, $i + 1);
     }
 
-    public static function newAdapter(array $config)
+    public static function newAdapter(\mysqli $connection, string $policy_table_name = 'casbin_rule'): static
     {
-        return new static($config);
+        return new static($connection, $policy_table_name);
     }
 
     public function initTable()
     {
-        $sql = file_get_contents(__DIR__.'/../migrations/'.$this->config['type'].'.sql');
+        $sql = file_get_contents(__DIR__ . '/../migrations/mysql.sql');
         $sql = str_replace('%table_name%', $this->policyTableName, $sql);
-        $this->connection->execute($sql, []);
+        $this->connection->query($sql);
     }
 
     public function savePolicyLine($ptype, array $rule)
     {
         $col['ptype'] = $ptype;
         foreach ($rule as $key => $value) {
-            $col['v'.strval($key).''] = $value;
+            $col['v' . strval($key) . ''] = $value;
         }
 
         $colStr = implode(', ', array_keys($col));
 
         $name = rtrim(str_repeat('?, ', count($col)), ', ');
 
-        $sql = 'INSERT INTO '.$this->policyTableName.'('.$colStr.') VALUES ('.$name.') ';
+        $sql = 'INSERT INTO ' . $this->policyTableName . '(' . $colStr . ') VALUES (' . $name . ') ';
 
-        $this->connection->execute($sql, array_values($col));
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare statement: ' . $this->connection->error);
+        }
+
+        $values = array_values($col);
+        $stmt->bind_param(str_repeat('s', count($col)), ...$values);
+
+        $stmt->execute();
+
+        if ($stmt->error) {
+            throw new \Exception('Failed to execute statement: ' . $stmt->error);
+        }
+
+        $stmt->close();
     }
 
     /**
@@ -121,11 +130,14 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      */
     public function loadPolicy(Model $model): void
     {
-        $rows = $this->connection->query('SELECT ptype, v0, v1, v2, v3, v4, v5 FROM '.$this->policyTableName.'');
-
-        foreach ($rows as $row) {
+        $result = $this->connection->query('SELECT ptype, v0, v1, v2, v3, v4, v5 FROM ' . $this->policyTableName);
+        if (!$result) {
+            throw new \Exception('Failed to execute query: ' . $this->connection->error);
+        }
+        while ($row = $result->fetch_assoc()) {
             $this->loadPolicyArray($this->filterRule($row), $model);
         }
+        $result->free();
     }
 
     /**
@@ -135,16 +147,24 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      */
     public function savePolicy(Model $model): void
     {
-        foreach ($model['p'] as $ptype => $ast) {
-            foreach ($ast->policy as $rule) {
-                $this->savePolicyLine($ptype, $rule);
-            }
+        if (!$this->connection->begin_transaction()) {
+            throw new \Exception('Failed to start transaction: ' . $this->connection->error);
         }
-
-        foreach ($model['g'] as $ptype => $ast) {
-            foreach ($ast->policy as $rule) {
-                $this->savePolicyLine($ptype, $rule);
+        try {
+            foreach ($model['p'] as $ptype => $ast) {
+                foreach ($ast->policy as $rule) {
+                    $this->savePolicyLine($ptype, $rule);
+                }
             }
+            foreach ($model['g'] as $ptype => $ast) {
+                foreach ($ast->policy as $rule) {
+                    $this->savePolicyLine($ptype, $rule);
+                }
+            }
+            $this->connection->commit();
+        } catch (Throwable $e) {
+            $this->connection->rollback();
+            throw $e;
         }
     }
 
@@ -178,19 +198,32 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
         }, $sets));
         $sql = 'INSERT INTO ' . $table . ' (' . implode(', ', $columns) . ')' .
             ' VALUES' . $valuesStr;
-        $this->connection->execute($sql, $values);
+
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare statement: ' . $this->connection->error);
+        }
+        $types = str_repeat('s', count($values));
+        $stmt->bind_param($types, ...$values);
+        $stmt->execute();
+        if ($stmt->error) {
+            throw new \Exception('Failed to execute statement: ' . $stmt->error);
+        }
+        $stmt->close();
     }
 
     public function removePolicies(string $sec, string $ptype, array $rules): void
     {
-        $this->connection->getPdo()->beginTransaction();
+        if (!$this->connection->begin_transaction()) {
+            throw new \Exception('Failed to start transaction: ' . $this->connection->error);
+        }
         try {
             foreach ($rules as $rule) {
                 $this->removePolicy($sec, $ptype, $rule);
             }
-            $this->connection->getPdo()->commit();
+            $this->connection->commit();
         } catch (Throwable $e) {
-            $this->connection->getPdo()->rollback();
+            $this->connection->rollback();
             throw $e;
         }
     }
@@ -204,16 +237,32 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      */
     public function removePolicy(string $sec, string $ptype, array $rule): void
     {
-        $where['ptype'] = $ptype;
-        $condition[] = 'ptype = :ptype';
+        $where = ['ptype' => $ptype];
+        $condition = ['ptype = ?'];
+        $types = 's'; // ptype is a string
+        $values = [$ptype];
+
         foreach ($rule as $key => $value) {
-            $where['v'.strval($key)] = $value;
-            $condition[] = 'v'.strval($key).' = :'.'v'.strval($key);
+            $where['v' . $key] = $value;
+            $condition[] = 'v' . $key . ' = ?';
+            $types .= 's'; // Assuming all rule values are strings
+            $values[] = $value;
         }
 
-        $sql = 'DELETE FROM '.$this->policyTableName.' WHERE '.implode(' AND ', $condition);
+        $sql = 'DELETE FROM ' . $this->policyTableName . ' WHERE ' . implode(' AND ', $condition);
 
-        $this->connection->execute($sql, $where);
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare statement: ' . $this->connection->error);
+        }
+
+        $stmt->bind_param($types, ...$values);
+
+        if (!$stmt->execute()) {
+            throw new \Exception('Failed to execute statement: ' . $stmt->error);
+        }
+
+        $stmt->close();
     }
 
     /**
@@ -227,43 +276,66 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
     public function _removeFilteredPolicy(string $sec, string $ptype, int $fieldIndex, ?string ...$fieldValues): array
     {
         $removedRules = [];
-        $where['ptype'] = $ptype;
-        $condition[] = 'ptype = :ptype';
+        $where = ['ptype' => $ptype];
+        $condition = ['ptype = ?'];
+        $types = 's';
+        $values = [$ptype];
+
         foreach (range(0, 5) as $value) {
             if ($fieldIndex <= $value && $value < $fieldIndex + count($fieldValues)) {
-                if ('' != $fieldValues[$value - $fieldIndex]) {
-                    $where['v'.strval($value)] = $fieldValues[$value - $fieldIndex];
-                    $condition[] = 'v'.strval($value).' = :'.'v'.strval($value);
+                if ($fieldValues[$value - $fieldIndex] !== '') {
+                    $where['v' . $value] = $fieldValues[$value - $fieldIndex];
+                    $condition[] = 'v' . $value . ' = ?';
+                    $types .= 's';
+                    $values[] = $fieldValues[$value - $fieldIndex];
                 }
             }
         }
 
-        $deleteSql = "DELETE FROM {$this->policyTableName} WHERE " . implode(' AND ', $condition);
-
-        $selectSql = "SELECT * FROM {$this->policyTableName} WHERE " . implode(' AND ', $condition);
-
-        $oldP = $this->connection->query($selectSql, $where);
-        foreach ($oldP as &$item) {
-            unset($item['ptype']);
-            unset($item['id']);
-            $item = $this->filterRule($item);
-            $removedRules[] = $item;
+        // Select old policies
+        $selectSql = "SELECT ptype, v0, v1, v2, v3, v4, v5 FROM {$this->policyTableName} WHERE " . implode(' AND ', $condition);
+        $stmt = $this->connection->prepare($selectSql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare select statement: ' . $this->connection->error);
         }
 
-        $this->connection->execute($deleteSql, $where);
+        $stmt->bind_param($types, ...$values);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        while ($row = $result->fetch_assoc()) {
+            unset($row['ptype']);
+            unset($row['id']);
+            $removedRules[] = $this->filterRule($row);
+        }
+        $stmt->close();
+
+        // Delete policies
+        $deleteSql = "DELETE FROM {$this->policyTableName} WHERE " . implode(' AND ', $condition);
+        $stmt = $this->connection->prepare($deleteSql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare delete statement: ' . $this->connection->error);
+        }
+
+        $stmt->bind_param($types, ...$values);
+        if (!$stmt->execute()) {
+            throw new \Exception('Failed to execute delete statement: ' . $stmt->error);
+        }
+        $stmt->close();
+
         return $removedRules;
     }
 
     /**
-      * RemoveFilteredPolicy removes policy rules that match the filter from the storage.
-      * This is part of the Auto-Save feature.
-      *
-      * @param string $sec
-      * @param string $ptype
-      * @param int $fieldIndex
-      * @param string ...$fieldValues
-      * @throws Exception|Throwable
-      */
+     * RemoveFilteredPolicy removes policy rules that match the filter from the storage.
+     * This is part of the Auto-Save feature.
+     *
+     * @param string $sec
+     * @param string $ptype
+     * @param int $fieldIndex
+     * @param string ...$fieldValues
+     * @throws Throwable
+     */
     public function removeFilteredPolicy(string $sec, string $ptype, int $fieldIndex, string ...$fieldValues): void
     {
         $this->_removeFilteredPolicy($sec, $ptype, $fieldIndex, ...$fieldValues);
@@ -275,42 +347,55 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      * @param Model $model
      * @param mixed $filter
      *
-     * @throws CasbinException
+     * @throws Throwable
      */
     public function loadFilteredPolicy(Model $model, $filter): void
     {
-        // the basic sql
-        $sql = 'SELECT ptype, v0, v1, v2, v3, v4, v5 FROM '.$this->policyTableName . ' WHERE ';
-
-        $bind = [];
+        $sql = 'SELECT ptype, v0, v1, v2, v3, v4, v5 FROM ' . $this->policyTableName . ' WHERE ';
+        $types = '';
+        $values = [];
 
         if (is_string($filter)) {
             $filter = str_replace(' ', '', $filter);
             $filter = str_replace('\'', '', $filter);
             $filter = explode('=', $filter);
-            $sql .= "$filter[0] = :{$filter[0]}";
-            $bind[$filter[0]] = $filter[1];
+            $sql .= "$filter[0] = ?";
+            $types = 's';
+            $values[] = $filter[1];
         } elseif ($filter instanceof Filter) {
+            $conditions = [];
             foreach ($filter->p as $k => $v) {
-                $where[] = $v . ' = :' . $v;
-                $bind[$v] = $filter->g[$k];
+                $conditions[] = $v . ' = ?';
+                $types .= 's';
+                $values[] = $filter->g[$k];
             }
-            $where = implode(' AND ', $where);
-            $sql .= $where;
+            $sql .= implode(' AND ', $conditions);
         } elseif ($filter instanceof Closure) {
             $where = '';
             $filter($where);
             $where = str_replace(' ', '', $where);
             $where = str_replace('\'', '', $where);
             $where = explode('=', $where);
-            $sql .= "$where[0] = :{$where[0]}";
-            $bind[$where[0]] = $where[1];
+            $sql .= "$where[0] = ?";
+            $types .= 's';
+            $values[] = $where[1];
         } else {
             throw new InvalidFilterTypeException('invalid filter type');
         }
 
-        $rows = $this->connection->query($sql, $bind);
-        foreach ($rows as $row) {
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare statement: ' . $this->connection->error);
+        }
+
+        if (!empty($values)) {
+            $stmt->bind_param($types, ...$values);
+        }
+
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        while ($row = $result->fetch_assoc()) {
             $row = array_filter($row, function ($value) {
                 return !is_null($value) && $value !== '';
             });
@@ -321,6 +406,7 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
             $this->loadPolicyLine(trim($line), $model);
         }
 
+        $stmt->close();
         $this->setFiltered(true);
     }
 
@@ -335,25 +421,40 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      */
     public function updatePolicy(string $sec, string $ptype, array $oldRule, array $newPolicy): void
     {
-        $where['ptype'] = $ptype;
-        $condition[] = 'ptype = :ptype';
+        $where = ['ptype' => $ptype];
+        $condition = ['ptype = ?'];
+        $types = 's';
+        $values = [$ptype];
 
         foreach ($oldRule as $key => $value) {
-            $placeholder = "w" . strval($key);
-            $where['w' . strval($key)] = $value;
-            $condition[] = 'v' . strval($key) . ' = :' . $placeholder;
+            $where['w' . $key] = $value;
+            $condition[] = 'v' . $key . ' = ?';
+            $types .= 's';
+            $values[] = $value;
         }
 
         $update = [];
+        $updateValues = [];
         foreach ($newPolicy as $key => $value) {
-            $placeholder = "s" . strval($key);
-            $updateValue["$placeholder"] = $value;
-            $update[] = 'v' . strval($key) . ' = :' . $placeholder;
+            $update[] = 'v' . $key . ' = ?';
+            $types .= 's';
+            $updateValues[] = $value;
         }
 
         $sql = "UPDATE {$this->policyTableName} SET " . implode(', ', $update) . " WHERE " . implode(' AND ', $condition);
 
-        $this->connection->execute($sql, array_merge($updateValue, $where));
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+            throw new \Exception('Failed to prepare statement: ' . $this->connection->error);
+        }
+
+        $stmt->bind_param($types, ...array_merge($updateValues, $values));
+
+        if (!$stmt->execute()) {
+            throw new \Exception('Failed to execute statement: ' . $stmt->error);
+        }
+
+        $stmt->close();
     }
 
     /**
@@ -367,14 +468,16 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
      */
     public function updatePolicies(string $sec, string $ptype, array $oldRules, array $newRules): void
     {
-        $this->connection->getPdo()->beginTransaction();
+        if (!$this->connection->begin_transaction()) {
+            throw new \Exception('Failed to start transaction: ' . $this->connection->error);
+        }
         try {
             foreach ($oldRules as $i => $oldRule) {
                 $this->updatePolicy($sec, $ptype, $oldRule, $newRules[$i]);
             }
-            $this->connection->getPdo()->commit();
+            $this->connection->commit();
         } catch (Throwable $e) {
-            $this->connection->getPdo()->rollback();
+            $this->connection->rollback();
             throw $e;
         }
     }
@@ -391,13 +494,15 @@ class Adapter implements AdapterContract, FilteredAdapterContract, BatchAdapterC
     public function updateFilteredPolicies(string $sec, string $ptype, array $newRules, int $fieldIndex, ?string ...$fieldValues): array
     {
         $oldRules = [];
-        $this->connection->getPdo()->beginTransaction();
+        if (!$this->connection->begin_transaction()) {
+            throw new \Exception('Failed to start transaction: ' . $this->connection->error);
+        }
         try {
             $oldRules = $this->_removeFilteredPolicy($sec, $ptype, $fieldIndex, ...$fieldValues);
             $this->addPolicies($sec, $ptype, $newRules);
-            $this->connection->getPdo()->commit();
+            $this->connection->commit();
         } catch (Throwable $e) {
-            $this->connection->getPdo()->rollback();
+            $this->connection->rollback();
             throw $e;
         }
 

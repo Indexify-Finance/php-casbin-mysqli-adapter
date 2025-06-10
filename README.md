@@ -10,12 +10,12 @@ Database adapter for [PHP-Casbin](https://github.com/php-casbin/php-casbin).
 
 The current supported databases are:
 
-| type | database |
-| ------ | ------ |
-| mysql | MySQL |
-| pgsql | PostgreSQL |
-| sqlite | SQLite |
-| sqlsrv | SqlServer |
+| type   | database   |
+| ------ | ---------- |
+| mysql  | MySQL      |
+| pgsql  | PostgreSQL |
+| sqlite | SQLite     |
+| sqlsrv | SqlServer  |
 
 ### Installation
 
