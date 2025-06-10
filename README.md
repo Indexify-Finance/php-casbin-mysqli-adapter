@@ -1,50 +1,53 @@
-# Database adapter for php-casbin
+# MySQLi Adapter for php-casbin
 
-[![Build Status](https://github.com/php-casbin/database-adapter/actions/workflows/build.yml/badge.svg)](https://github.com/php-casbin/database-adapter/actions/workflows/build.yml)
-[![Coverage Status](https://coveralls.io/repos/github/php-casbin/database-adapter/badge.svg)](https://coveralls.io/github/php-casbin/database-adapter)
-[![Latest Stable Version](https://poser.pugx.org/casbin/database-adapter/v/stable)](https://packagist.org/packages/casbin/database-adapter)
-[![Total Downloads](https://poser.pugx.org/casbin/database-adapter/downloads)](https://packagist.org/packages/casbin/database-adapter)
-[![License](https://poser.pugx.org/casbin/database-adapter/license)](https://packagist.org/packages/casbin/database-adapter)
+> **Forked from [php-casbin/database-adapter](https://github.com/php-casbin/database-adapter)**
 
-Database adapter for [PHP-Casbin](https://github.com/php-casbin/php-casbin).
+This is a database adapter for [PHP-Casbin](https://github.com/php-casbin/php-casbin) rewritten to use **MySQLi only**.  
+It does **not** use PDO or [leeqvip/database](https://github.com/leeqvip/database).
 
-The current supported databases are:
+## Supported Database
 
-| type   | database   |
-| ------ | ---------- |
-| mysql  | MySQL      |
-| pgsql  | PostgreSQL |
-| sqlite | SQLite     |
-| sqlsrv | SqlServer  |
+MySQL databases are supported by instantiating a native PHP MySQLi connection and passing it into the constructor.
 
-### Installation
+## Installation
 
-Use [Composer](https://getcomposer.org/)
+Use [Composer](https://getcomposer.org/) and add the following to your `composer.json`:
 
+```json
+{
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "https://github.com/Indexify-Finance/php-casbin-mysqli-adapter"
+    }
+  ],
+  "require": {
+    "indexify/php-casbin-mysqli-adapter": "dev-master"
+  }
+}
 ```
-composer require casbin/database-adapter
+
+Then run:
+
+```sh
+composer update
 ```
 
-### Usage
+## Usage
 
 ```php
-
 require_once './vendor/autoload.php';
 
 use Casbin\Enforcer;
-use Casbin\Util\Log;
-use CasbinAdapter\Database\Adapter as DatabaseAdapter;
+use PhpCasbinMysqliAdapter\Database\Adapter as DatabaseAdapter;
 
-$config = [
-    'type'     => 'mysql', // mysql,pgsql,sqlite,sqlsrv
-    'hostname' => '127.0.0.1',
-    'database' => 'test',
-    'username' => 'root',
-    'password' => 'abc-123',
-    'hostport' => '3306',
-];
-
-$adapter = DatabaseAdapter::newAdapter($config);
+$connection = new mysqli(
+    'localhost',    // hostname
+    'username',     // database username
+    'password',     // database password
+    'database_name' // database name
+);
+$adapter = DatabaseAdapter::newAdapter($connection, policy_table_name: 'casbin_rule');
 
 $e = new Enforcer('path/to/model.conf', $adapter);
 
@@ -59,10 +62,10 @@ if ($e->enforce($sub, $obj, $act) === true) {
 }
 ```
 
-### Getting Help
+## Getting Help
 
 - [php-casbin](https://github.com/php-casbin/php-casbin)
 
-### License
+## License
 
 This project is licensed under the [Apache 2.0 license](LICENSE).
